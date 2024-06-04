@@ -37,6 +37,22 @@
 
 VLOG_DEFINE_THIS_MODULE(vif_plug_representor);
 
+struct lif_interface_info {
+    char id[40];
+    char ifname[16];
+    char mac[20];
+    uint32_t ifindex;
+    char representor[20];
+    bool physical; // true for pf interface otherwise vf interface
+    uint16_t pf_number;
+    uint16_t vf_number;
+};
+
+struct pds_pf_info {
+    int count;
+    struct lif_interface_info **int_info;
+};
+
 enum port_node_source {
     PORT_NODE_SOURCE_DUMP,
     PORT_NODE_SOURCE_RUNTIME,
@@ -689,11 +705,167 @@ next:
     return changed;
 }
 
+
+static int
+get_lif_read(struct pds_pf_info *pds_info)
+{
+    char input[] = "/nic/pds_interface.data";
+    //char *input = argv[1];
+    FILE *input_file;
+    // for now support 20 entries move to dynamic allocation after poc
+    struct lif_interface_info vfs[20];
+    char line[128];
+    int iface_count = 0;
+    struct lif_interface_info **vfs_dump;
+    uint32_t min_ifindex = 0; // used for sorting
+    char rep_name[10];
+
+
+    input_file = fopen(input, "r");
+
+    //fopen returns 0, the NULL pointer, on failure
+    if (input_file == 0)
+    {
+        VLOG_ERR("cannot open input file %s, error (%s)", input, ovs_strerror(errno));
+        return -1;
+    }
+    while (fgets(line, sizeof(line), input_file))
+    {
+        char key[16];
+        if (ovs_scan(line, "ID                        : %s", key)) {
+            strcpy(vfs[iface_count].id, key);
+        } else if(ovs_scan(line, "If Index                    : %s", key)) {
+            uint32_t indexVal;
+            sscanf(key, "%x", &indexVal);
+            vfs[iface_count].ifindex = indexVal;
+            if ((min_ifindex == 0) || (min_ifindex > indexVal)) {
+                min_ifindex = indexVal;
+            }
+        } else if (ovs_scan(line, "Interface                 : %s", key)) {
+            strcpy(vfs[iface_count].ifname, key);
+        } else if (ovs_scan(line, "MAC Address               : %s", key)) {
+            strcpy(vfs[iface_count].mac, key);
+        } else if (ovs_scan(line, "VF                        : %s", key)) {
+            if (!strcmp(key, "false")) {
+                vfs[iface_count].physical = true;
+            } else {
+                vfs[iface_count].physical = false;
+            }
+            VLOG_DBG("s : type[%s] id[%s] ifname[%s] mac[%s]\n", vfs[iface_count].physical ? "physical" : "virtual", vfs[iface_count].id, vfs[iface_count].ifname, vfs[iface_count].mac);
+            iface_count = iface_count + 1;
+        }
+    }
+    fclose(input_file);
+
+    if (iface_count > 0) {
+        vfs_dump = (struct lif_interface_info**) malloc(iface_count * sizeof(struct lif_interface_info));
+    }
+    // reorder according to the ifindex
+    for ( int i = 0 ; i < iface_count; i++) {
+        int lif_pos = vfs[i].ifindex % min_ifindex;
+        vfs_dump[lif_pos] = (struct lif_interface_info*) malloc(sizeof(struct lif_interface_info));
+        struct lif_interface_info *vpfp = vfs_dump[lif_pos];
+        strcpy(vpfp->id, vfs[i].id);
+        strcpy(vpfp->ifname,vfs[i].ifname);
+        strcpy(vpfp->mac, vfs[i].mac);
+        vpfp->ifindex = vfs[i].ifindex;
+        vpfp->physical = vfs[i].physical;
+    }
+    int pf_number = -1;
+    int vf_number = 0;
+    char pf_mac[20];
+    for (int i = 0; i < iface_count; i++) {
+        if (vfs_dump[i]->physical) {
+            memset(pf_mac, 0, sizeof(pf_mac));
+            strncpy(pf_mac, vfs_dump[i]->mac, sizeof(vfs_dump[i]->mac));
+            pf_number++; // pf_number to use until the new pf numebr is found
+            vf_number=0; // reset
+            memset(rep_name, 0, sizeof(rep_name));
+            sprintf(rep_name, "pf%d", pf_number);
+            vfs_dump[i]->pf_number = pf_number;
+            vfs_dump[i]->vf_number = vf_number;
+            memset(vfs_dump[i]->representor, 0, sizeof(vfs_dump[i]->representor));
+            strncpy(vfs_dump[i]->representor, rep_name, sizeof(rep_name));
+
+        } else {
+            memset(rep_name, 0, sizeof(rep_name));
+            sprintf(rep_name, "pf%dvf%d", pf_number, vf_number);
+            // copy pf mac to the vfs
+            memset(vfs_dump[i]->mac, 0, sizeof(vfs_dump[i]->mac));
+            strncpy(vfs_dump[i]->mac, pf_mac, sizeof(pf_mac));
+            memset(vfs_dump[i]->representor, 0, sizeof(vfs_dump[i]->representor));
+            strncpy(vfs_dump[i]->representor, rep_name, sizeof(rep_name));
+            vfs_dump[i]->pf_number = pf_number;
+            vfs_dump[i]->vf_number = vf_number;
+            vf_number++;
+        }
+    }
+    pds_info->count = iface_count;
+    pds_info->int_info = vfs_dump;
+
+    return 0;
+}
+
+static int
+pds_lif_dump()
+{
+    struct pds_pf_info *pds_info;
+    int error;
+    pds_info = (struct pds_pf_info*) malloc(sizeof(struct pds_pf_info));
+    error = get_lif_read(pds_info);
+    if (error != 0) {
+        VLOG_ERR("error code:%d", error);
+        return error;
+    }
+    int dpdk_port_number = 1;
+
+    port_table = port_table_create();
+
+    struct eth_addr pf_mac;
+    struct lif_interface_info *vpfp;
+    char dpdk_name[20];
+    for ( int i = 0 ; i < pds_info->count; i++) {
+        vpfp = pds_info->int_info[i];
+        if (!eth_addr_from_string(vpfp->mac, &pf_mac)) {
+            VLOG_ERR("Unable to parse option as Ethernet address for lif: %s",  vpfp->mac);
+            return -1;
+        }
+        VLOG_WARN("id[%s] ifindex[%u] ifname[%s] mac[%s] rep[%s]", vpfp->id, vpfp->ifindex, vpfp->ifname, vpfp->mac, vpfp->representor);
+        memset(dpdk_name, 0, sizeof(dpdk_name));
+        sprintf(dpdk_name, "dpdk%d", dpdk_port_number++);
+        if (vpfp->physical) {
+            VLOG_DBG("pf[%d]", vpfp->pf_number);
+            port_table_update_entry(port_table, "pci", "0000:60:00.0", vpfp->ifindex, dpdk_name,
+                                    UINT32_MAX, vpfp->pf_number, UINT16_MAX,
+                                    DEVLINK_PORT_FLAVOUR_PCI_PF, pf_mac, PORT_NODE_SOURCE_DUMP);
+        } else {
+            VLOG_DBG("pf[%d] vf[%d]", vpfp->pf_number, vpfp->vf_number);
+            port_table_update_entry(port_table, "pci", "0000:60:00.0", vpfp->ifindex, dpdk_name,
+                                    UINT32_MAX, vpfp->pf_number, vpfp->vf_number,
+                                    DEVLINK_PORT_FLAVOUR_PCI_VF, pf_mac, PORT_NODE_SOURCE_DUMP);
+        }
+    }
+    for (int i = 0; i < pds_info->count; i++) {
+        free(pds_info->int_info[i]);
+    }
+    free(pds_info->int_info);
+    free(pds_info);
+
+    return 0;
+}
+
 static int
 vif_plug_representor_init(void)
 {
     int error;
 
+#ifndef PENSANDO_PATCH
+    error = pds_lif_dump();
+    if (error) {
+        return error;
+    }
+
+#else
     error = devlink_monitor_init();
     if (error) {
         return error;
@@ -703,6 +875,7 @@ vif_plug_representor_init(void)
     if (error) {
         return error;
     }
+#endif
 
 #ifdef HAVE_UDEV
     udev_monitor_init();
@@ -714,7 +887,11 @@ vif_plug_representor_init(void)
 static bool
 vif_plug_representor_run(struct vif_plug_class *plug_class OVS_UNUSED)
 {
+#ifndef PENSANDO_PATCH
+    return false; // pensando vf's are static
+#else
     return devlink_monitor_run() & udev_monitor_run();
+#endif
 }
 
 static int
@@ -777,7 +954,26 @@ vif_plug_representor_port_prepare(const struct vif_plug_port_ctx_in *ctx_in,
 
     if (ctx_out) {
         ctx_out->name = pn->netdev_name;
+#ifndef PENSANDO_PATCH
+        ctx_out->type = "dpdk";
+        VLOG_DBG("Representor port found for "
+                "lport: %s pf-mac: '%s' vf-num: '%s' result: '%s'",
+                ctx_in->lport_name, opt_pf_mac, opt_vf_num, pn->netdev_name);
+        char vdev_options[50];
+
+        smap_init(&ctx_out->iface_options);
+        sprintf(vdev_options, "vdev=net_ionic,representor=pf%dvf%d", pn->pf->number, pn->number);
+
+        smap_add(&ctx_out->iface_options, "dpdk-devargs", vdev_options);
+        smap_add(&ctx_out->iface_options, "mtu", "9216");
+        smap_add(&ctx_out->iface_options, "n_txq", "8");
+        smap_add(&ctx_out->iface_options, "n_txq_desc", "16");
+        smap_add(&ctx_out->iface_options, "n_rxq", "8");
+        smap_add(&ctx_out->iface_options, "n_rxq_desc", "16");
+#else
         ctx_out->type = NULL;
+#endif
+
     }
     return true;
 }
@@ -795,7 +991,13 @@ vif_plug_representor_port_ctx_destroy(
         const struct vif_plug_port_ctx_in *ctx_in OVS_UNUSED,
         struct vif_plug_port_ctx_out *ctx_out OVS_UNUSED)
 {
+#ifndef PENSANDO_PATCH
+    if(ctx_out) {
+        smap_destroy(&ctx_out->iface_options);
+    }
+#else
     /* Noting to be done here for now */
+#endif
 }
 
 const struct vif_plug_class vif_plug_representor = {
